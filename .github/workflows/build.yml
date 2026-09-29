@@ -1,0 +1,198 @@
+# FlyWeb Build Workflow
+# Placed in the Tauri template repo at: .github/workflows/build.yml
+#
+# Triggered via workflow_dispatch from the FlyWeb API.
+# Inputs injected by the API:
+#   - build_id       : UUID matching the builds table row
+#   - tauri_config   : base64-encoded tauri.conf.json
+#   - platforms      : comma-separated list e.g. "windows,linux,macos,android"
+#   - callback_url   : https://api.fly.web.id/api/builds/webhook
+#   - webhook_secret : WEBHOOK_SECRET from the FlyWeb server env
+
+name: Build Tauri App
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+        type: string
+      tauri_config:
+        required: true
+        type: string        # base64-encoded JSON
+      platforms:
+        required: true
+        type: string        # "windows,linux,macos,android"
+      callback_url:
+        required: true
+        type: string
+      webhook_secret:
+        required: true
+        type: string
+
+env:
+  BUILD_ID: ${{ inputs.build_id }}
+  CALLBACK_URL: ${{ inputs.callback_url }}
+  WEBHOOK_SECRET: ${{ inputs.webhook_secret }}
+
+jobs:
+  # ── Decode config once ────────────────────────────────────────────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Decode tauri config
+        run: |
+          echo "${{ inputs.tauri_config }}" | base64 -d > /tmp/tauri.conf.json
+          cat /tmp/tauri.conf.json
+
+      - name: Set platform matrix
+        id: set-matrix
+        run: |
+          IFS=',' read -ra PLATS <<< "${{ inputs.platforms }}"
+          JSON=$(printf '%s\n' "${PLATS[@]}" | jq -R . | jq -sc .)
+          echo "matrix=$JSON" >> $GITHUB_OUTPUT
+
+  # ── Build per platform ────────────────────────────────────────────────────
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJson(needs.prepare.outputs.matrix) }}
+        include:
+          - platform: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_ext: ".exe"
+          - platform: linux
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact_ext: ".AppImage"
+          - platform: macos
+            os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_ext: ".dmg"
+          - platform: android
+            os: ubuntu-22.04
+            target: aarch64-linux-android
+            artifact_ext: ".apk"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decode tauri config
+        shell: bash
+        run: |
+          echo "${{ inputs.tauri_config }}" | base64 -d > src-tauri/tauri.conf.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            libgtk-3-dev libsoup-3.0-dev
+
+      - name: Install Android SDK & NDK
+        if: matrix.platform == 'android'
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Java (Android)
+        if: matrix.platform == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Node.js (for Tauri CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Tauri CLI
+        run: npm install -g @tauri-apps/cli@2
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+
+      - name: Build (desktop)
+        if: matrix.platform != 'android'
+        run: tauri build --target ${{ matrix.target }}
+
+      - name: Build (Android)
+        if: matrix.platform == 'android'
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: tauri android build --target aarch64
+
+      # ── Upload to R2 via AWS CLI ──────────────────────────────────────────
+      - name: Find artifact
+        id: find-artifact
+        shell: bash
+        run: |
+          EXT="${{ matrix.artifact_ext }}"
+          FILE=$(find src-tauri/target -name "*${EXT}" -not -path "*/deps/*" | head -1)
+          echo "file=$FILE" >> $GITHUB_OUTPUT
+          echo "filename=$(basename $FILE)" >> $GITHUB_OUTPUT
+          echo "size=$(wc -c < "$FILE")" >> $GITHUB_OUTPUT
+
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          R2_KEY="builds/${{ env.BUILD_ID }}/${{ matrix.platform }}/${{ steps.find-artifact.outputs.filename }}"
+          aws s3 cp \
+            "${{ steps.find-artifact.outputs.file }}" \
+            "s3://${R2_BUCKET}/${R2_KEY}" \
+            --endpoint-url "${R2_ENDPOINT}"
+          echo "R2_KEY=$R2_KEY" >> $GITHUB_ENV
+
+      # ── Notify FlyWeb API ─────────────────────────────────────────────────
+      - name: Webhook — success
+        if: success()
+        shell: bash
+        run: |
+          curl -fsSL -X POST "${{ env.CALLBACK_URL }}" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: ${{ env.WEBHOOK_SECRET }}" \
+            -d '{
+              "buildId":        "${{ env.BUILD_ID }}",
+              "platform":       "${{ matrix.platform }}",
+              "status":         "completed",
+              "workflowRunId":  ${{ github.run_id }},
+              "artifact": {
+                "filename": "${{ steps.find-artifact.outputs.filename }}",
+                "size":     ${{ steps.find-artifact.outputs.size }},
+                "r2Key":    "'"$R2_KEY"'"
+              }
+            }'
+
+      - name: Webhook — failure
+        if: failure()
+        shell: bash
+        run: |
+          curl -fsSL -X POST "${{ env.CALLBACK_URL }}" \
+            -H "Content-Type: application/json" \
+            -H "x-webhook-secret: ${{ env.WEBHOOK_SECRET }}" \
+            -d '{
+              "buildId":        "${{ env.BUILD_ID }}",
+              "platform":       "${{ matrix.platform }}",
+              "status":         "failed",
+              "workflowRunId":  ${{ github.run_id }},
+              "error":          "Build failed — check GitHub Actions logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }'
